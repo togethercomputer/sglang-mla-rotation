@@ -210,6 +210,11 @@ class Envs:
     SGLANG_FAKE_QUANT_KV = EnvStr("")
     SGLANG_FAKE_QUANT_KV_TYPE = EnvStr("int")
     SGLANG_FAKE_QUANT_KV_BITS = EnvInt(8)
+    # Hadamard rotation for KV cache (applied before fake quant, cancelled in attention).
+    # SGLANG_ROTATE_K: enable FWHT rotation on K write + Q read + output inverse.
+    # SGLANG_ROTATE_K_ORDER: group size for FWHT (must divide head_dim). Default 16.
+    SGLANG_ROTATE_K = EnvBool(False)
+    SGLANG_ROTATE_K_ORDER = EnvInt(16)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)

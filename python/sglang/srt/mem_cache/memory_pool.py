@@ -88,6 +88,34 @@ _fake_kv_shape_warn_mla_nope = False
 _fake_kv_shape_warn_mla_rope = False
 
 
+def _hadamard_rotate(x: torch.Tensor, order: int) -> torch.Tensor:
+    """Apply normalized Fast Walsh-Hadamard Transform on the last dim in groups of ``order``."""
+    import math
+
+    from fast_hadamard_transform import hadamard_transform
+
+    orig_shape = x.shape
+    assert orig_shape[-1] % order == 0, (
+        f"last dim {orig_shape[-1]} not divisible by hadamard order {order}"
+    )
+    x = x.view(*orig_shape[:-1], orig_shape[-1] // order, order)
+    x = hadamard_transform(x.contiguous() / math.sqrt(order))
+    return x.view(orig_shape)
+
+
+def _maybe_rotate_k_for_mla(
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply Hadamard rotation to MLA K components before cache write (env-controlled)."""
+    if not envs.SGLANG_ROTATE_K.get():
+        return cache_k_nope, cache_k_rope
+    order = envs.SGLANG_ROTATE_K_ORDER.get()
+    cache_k_nope = _hadamard_rotate(cache_k_nope.float(), order).to(cache_k_nope.dtype)
+    cache_k_rope = _hadamard_rotate(cache_k_rope.float(), order).to(cache_k_rope.dtype)
+    return cache_k_nope, cache_k_rope
+
+
 def _maybe_fake_quant_kv_for_mha(
     cache_k: torch.Tensor,
     cache_v: torch.Tensor,
@@ -309,7 +337,8 @@ def _maybe_fake_quant_kv_for_mla(
 
     if apply_nope:
         if cache_k_nope.ndim >= 2:
-            cache_k_nope = _fq(cache_k_nope)
+            orig_dtype = cache_k_nope.dtype
+            cache_k_nope = _fq(cache_k_nope.float()).to(orig_dtype)
         elif not _fake_kv_shape_warn_mla_nope:
             logger.warning(
                 "Fake quant MLA k_nope skipped: shape %s has fewer than 2 dims",
@@ -319,7 +348,8 @@ def _maybe_fake_quant_kv_for_mla(
 
     if apply_rope:
         if cache_k_rope.ndim >= 2:
-            cache_k_rope = _fq(cache_k_rope)
+            orig_dtype = cache_k_rope.dtype
+            cache_k_rope = _fq(cache_k_rope.float()).to(orig_dtype)
         elif not _fake_kv_shape_warn_mla_rope:
             logger.warning(
                 "Fake quant MLA k_rope skipped: shape %s has fewer than 2 dims",
@@ -1881,6 +1911,10 @@ class MLATokenToKVPool(KVCache):
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
                 cache_k_rope = cache_k_rope.to(self.dtype)
+
+            cache_k_nope, cache_k_rope = _maybe_rotate_k_for_mla(
+                cache_k_nope, cache_k_rope
+            )
 
             cache_k_nope, cache_k_rope = _maybe_fake_quant_kv_for_mla(
                 cache_k_nope, cache_k_rope

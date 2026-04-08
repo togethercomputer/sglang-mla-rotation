@@ -31,6 +31,7 @@ from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+from sglang.srt.mem_cache.memory_pool import _hadamard_rotate
 
 
 @dataclass
@@ -192,6 +193,12 @@ class FlashAttentionBackend(AttentionBackend):
             )
             else 0
         )
+
+        # Hadamard rotation for MLA KV cache
+        from sglang.srt.environ import envs
+
+        self._rotate_k_enabled = self.use_mla and envs.SGLANG_ROTATE_K.get()
+        self._rotate_k_order = envs.SGLANG_ROTATE_K_ORDER.get()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -855,6 +862,12 @@ class FlashAttentionBackend(AttentionBackend):
                     q_nope = q_all[:, :, : layer.v_head_dim]
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
+                # Rotate Q to match rotated K in cache
+                if self._rotate_k_enabled:
+                    _order = self._rotate_k_order
+                    q_nope = _hadamard_rotate(q_nope.float(), _order).to(q_nope.dtype)
+                    q_rope = _hadamard_rotate(q_rope.float(), _order).to(q_rope.dtype)
+
                 result = flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
@@ -906,6 +919,10 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 else:
                     o = result
+
+                # Inverse-rotate output (V shares buffer with rotated k_nope)
+                if self._rotate_k_enabled:
+                    o = _hadamard_rotate(o.float(), self._rotate_k_order).to(o.dtype)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -1136,6 +1153,13 @@ class FlashAttentionBackend(AttentionBackend):
                 q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
+
+            # Rotate Q to match rotated K in cache
+            if self._rotate_k_enabled:
+                _order = self._rotate_k_order
+                q_nope = _hadamard_rotate(q_nope.float(), _order).to(q_nope.dtype)
+                q_rope = _hadamard_rotate(q_rope.float(), _order).to(q_rope.dtype)
+
             max_seqlen_q = metadata.max_seq_len_q
 
             result = flash_attn_with_kvcache(
@@ -1187,6 +1211,10 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 o = result
+
+            # Inverse-rotate output (V shares buffer with rotated k_nope)
+            if self._rotate_k_enabled:
+                o = _hadamard_rotate(o.float(), self._rotate_k_order).to(o.dtype)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

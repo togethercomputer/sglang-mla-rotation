@@ -25,6 +25,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.mem_cache.memory_pool import _hadamard_rotate
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm100_supported,
@@ -211,6 +212,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             and not get_global_server_args().flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
+
+        # Hadamard rotation for MLA KV cache
+        self._rotate_k_enabled = envs.SGLANG_ROTATE_K.get()
+        self._rotate_k_order = envs.SGLANG_ROTATE_K_ORDER.get()
 
         # Allocate buffers
         global global_workspace_buffer
@@ -581,6 +586,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     qall[:, :, : layer.v_head_dim],
                     qall[:, :, layer.v_head_dim :],
                 )
+
+            # Rotate Q to match rotated K in cache
+            if self._rotate_k_enabled:
+                _order = self._rotate_k_order
+                q = _hadamard_rotate(q.float(), _order).to(q.dtype)
+                q_rope = _hadamard_rotate(q_rope.float(), _order).to(q_rope.dtype)
+
             o = q.new_empty(q.shape)
             o = prefill_wrapper_paged.run(
                 q,
@@ -589,6 +601,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 k_buf[:, :, layer.v_head_dim :],
                 out=o,
             )
+
+            # Inverse-rotate output (V shares buffer with rotated k_nope)
+            if self._rotate_k_enabled:
+                o = _hadamard_rotate(o.float(), self._rotate_k_order).to(o.dtype)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -636,6 +652,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
+        # Rotate Q to match rotated K in cache
+        if self._rotate_k_enabled:
+            _order = self._rotate_k_order
+            q_nope = _hadamard_rotate(q_nope.float(), _order).to(q_nope.dtype)
+            q_rope = _hadamard_rotate(q_rope.float(), _order).to(q_rope.dtype)
+
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
             q.dtype
         )
@@ -649,6 +671,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buffer[:, :, layer.v_head_dim :],
             out=o,
         )
+
+        # Inverse-rotate output (V shares buffer with rotated k_nope)
+        if self._rotate_k_enabled:
+            o = _hadamard_rotate(o.float(), self._rotate_k_order).to(o.dtype)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
