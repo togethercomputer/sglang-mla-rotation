@@ -274,3 +274,7 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+
+eval_results/
+MLA_arch.md
+temp.sh
