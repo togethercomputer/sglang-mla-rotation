@@ -79,6 +79,170 @@ _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 
+# ``_maybe_fake_quant_kv_for_mha``: if ``cache_k`` / ``cache_v`` cannot be reshaped to
+# ``(..., head_num, head_dim)`` / ``(..., head_num, v_head_dim)``, we log once per stream
+# (K vs V) instead of spamming every ``set_kv_buffer`` call.
+_fake_kv_shape_warn_k = False
+_fake_kv_shape_warn_v = False
+
+
+def _maybe_fake_quant_kv_for_mha(
+    cache_k: torch.Tensor,
+    cache_v: torch.Tensor,
+    head_num: int,
+    head_dim: int,
+    v_head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Simulate KV quantization on write for ``MHATokenToKVPool`` (env-controlled).
+
+    Set **before** starting the server or Python process so values are read at runtime.
+
+    **``SGLANG_FAKE_QUANT_KV``** — what to fake-quant (default ``""`` = disabled). Accepted
+    values (case-insensitive): ``k`` / ``key`` (K only), ``v`` / ``value`` (V only),
+    ``kv`` / ``both`` / ``all`` / ``k+v`` (K and V). Also treated as off: ``0``, ``false``,
+    ``none``, ``off``, ``disable``, ``disabled``.
+
+    **``SGLANG_FAKE_QUANT_KV_TYPE``** — ``int`` (default) or ``fp``. ``fp`` also accepts
+    aliases ``nvfp4``, ``fp4``, ``e2m1`` and always uses NVFP4-style fake quant in
+    ``kv_quant_sim``. ``int`` uses signed per-head integer fake quant; bit width comes
+    from ``SGLANG_FAKE_QUANT_KV_BITS`` (default ``8``, valid range ``1``–``32``).
+
+    **Shell examples**::
+
+        export SGLANG_FAKE_QUANT_KV=kv
+        export SGLANG_FAKE_QUANT_KV_TYPE=int
+        export SGLANG_FAKE_QUANT_KV_BITS=4
+
+        export SGLANG_FAKE_QUANT_KV=kv
+        export SGLANG_FAKE_QUANT_KV_TYPE=nvfp4
+
+    **Programmatic** (e.g. tests): ``envs.SGLANG_FAKE_QUANT_KV.set("kv")`` and the same
+    for ``SGLANG_FAKE_QUANT_KV_TYPE`` / ``SGLANG_FAKE_QUANT_KV_BITS``; use ``.clear()``
+    to unset. See ``sglang.srt.environ`` for the field definitions.
+    """
+    global _fake_kv_shape_warn_k, _fake_kv_shape_warn_v
+
+    raw = envs.SGLANG_FAKE_QUANT_KV.get().strip().lower()
+    if not raw or raw in ("0", "false", "none", "off", "disable", "disabled"):
+        return cache_k, cache_v
+
+    apply_k = raw in ("k", "key")
+    apply_v = raw in ("v", "value")
+    if raw in ("kv", "both", "all", "k+v"):
+        apply_k = apply_v = True
+
+    if not apply_k and not apply_v:
+        logger.warning(
+            "SGLANG_FAKE_QUANT_KV=%r is not recognized (use k, v, kv, both, or all); skipping fake quant",
+            envs.SGLANG_FAKE_QUANT_KV.get(),
+        )
+        return cache_k, cache_v
+
+    kind = envs.SGLANG_FAKE_QUANT_KV_TYPE.get().strip().lower()
+    if kind in ("fp", "nvfp4", "fp4", "e2m1"):
+        from sglang.srt.mem_cache.kv_quant_sim import fake_nvfp4_quant_kv_per_head
+
+        def _fq(x: torch.Tensor) -> torch.Tensor:
+            return fake_nvfp4_quant_kv_per_head(x)
+
+    elif kind in ("int", "integer"):
+        bits = envs.SGLANG_FAKE_QUANT_KV_BITS.get()
+        if not (1 <= bits <= 32):
+            logger.warning(
+                "SGLANG_FAKE_QUANT_KV_BITS=%s invalid (need 1..32); skipping fake quant",
+                bits,
+            )
+            return cache_k, cache_v
+        from sglang.srt.mem_cache.kv_quant_sim import fake_int_quant_kv_per_head
+
+        def _fq(x: torch.Tensor) -> torch.Tensor:
+            return fake_int_quant_kv_per_head(x, bits)
+
+    else:
+        logger.warning(
+            "SGLANG_FAKE_QUANT_KV_TYPE=%r not recognized (use int or fp); skipping fake quant",
+            envs.SGLANG_FAKE_QUANT_KV_TYPE.get(),
+        )
+        return cache_k, cache_v
+
+    def _reshape_heads(
+        t: torch.Tensor, heads: int, last_dim: int
+    ) -> Tuple[Optional[torch.Tensor], torch.Size]:
+        shape = t.shape
+        if t.ndim == 3 and t.shape[-2] == heads and t.shape[-1] == last_dim:
+            return t, shape
+        if t.ndim == 2 and t.shape[-1] == heads * last_dim:
+            return t.contiguous().reshape(*t.shape[:-1], heads, last_dim), shape
+        return None, shape
+
+    if apply_k:
+        k3, kshape = _reshape_heads(cache_k, head_num, head_dim)
+        if k3 is not None:
+            cache_k = _fq(k3).reshape(kshape)
+        elif not _fake_kv_shape_warn_k:
+            logger.warning(
+                "Fake quant K skipped: shape %s not compatible with head_num=%s head_dim=%s",
+                tuple(cache_k.shape),
+                head_num,
+                head_dim,
+            )
+            _fake_kv_shape_warn_k = True
+
+    if apply_v:
+        v3, vshape = _reshape_heads(cache_v, head_num, v_head_dim)
+        if v3 is not None:
+            cache_v = _fq(v3).reshape(vshape)
+        elif not _fake_kv_shape_warn_v:
+            logger.warning(
+                "Fake quant V skipped: shape %s not compatible with head_num=%s v_head_dim=%s",
+                tuple(cache_v.shape),
+                head_num,
+                v_head_dim,
+            )
+            _fake_kv_shape_warn_v = True
+
+    return cache_k, cache_v
+
+
+def _log_mha_fake_quant_kv_init(
+    head_num: int,
+    head_dim: int,
+    v_head_dim: int,
+) -> None:
+    """Log once per pool when ``SGLANG_FAKE_QUANT_KV`` enables write-path simulation."""
+    raw = envs.SGLANG_FAKE_QUANT_KV.get()
+    raw_s = (str(raw).strip() if raw is not None else "") or ""
+    if not raw_s or raw_s.lower() in (
+        "0",
+        "false",
+        "none",
+        "off",
+        "disable",
+        "disabled",
+    ):
+        return
+
+    typ = envs.SGLANG_FAKE_QUANT_KV_TYPE.get()
+    bits = envs.SGLANG_FAKE_QUANT_KV_BITS.get()
+    typ_l = str(typ).strip().lower()
+    if typ_l in ("int", "integer"):
+        bits_part = f"SGLANG_FAKE_QUANT_KV_BITS={bits}"
+    else:
+        bits_part = f"SGLANG_FAKE_QUANT_KV_BITS={bits} (ignored for fp / NVFP4)"
+
+    logger.info(
+        "MHATokenToKVPool: KV fake-quant simulation enabled on cache write "
+        "(expected layouts: K [..., head=%s, dim=%s], V [..., head=%s, dim=%s]). "
+        "Env: SGLANG_FAKE_QUANT_KV=%r, SGLANG_FAKE_QUANT_KV_TYPE=%r, %s.",
+        head_num,
+        head_dim,
+        head_num,
+        v_head_dim,
+        raw_s,
+        typ,
+        bits_part,
+    )
+
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
@@ -791,6 +955,19 @@ class MHATokenToKVPool(KVCache):
 
         self._finalize_allocation_log(size)
 
+        logger.info(
+            "%s initialized: dtype=%s, heads=%s, head_dim=%s, v_head_dim=%s, "
+            "layers=%s, page_size=%s.",
+            type(self).__name__,
+            self.dtype,
+            self.head_num,
+            self.head_dim,
+            self.v_head_dim,
+            self.layer_num,
+            self.page_size,
+        )
+        _log_mha_fake_quant_kv_init(self.head_num, self.head_dim, self.v_head_dim)
+
         # for store_cache JIT kernel
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = self.head_dim == self.v_head_dim
@@ -1013,6 +1190,14 @@ class MHATokenToKVPool(KVCache):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
+
+        cache_k, cache_v = _maybe_fake_quant_kv_for_mha(
+            cache_k,
+            cache_v,
+            self.head_num,
+            self.head_dim,
+            self.v_head_dim,
+        )
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)

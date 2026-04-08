@@ -202,6 +202,14 @@ class Envs:
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # Optional fake KV quant on MHA cache write (MHATokenToKVPool.set_kv_buffer; see
+    # memory_pool._maybe_fake_quant_kv_for_mha docstring for full usage).
+    # SGLANG_FAKE_QUANT_KV: "" off; "k"/"v"/"kv"/"both"/"all"/"k+v" what to quantize.
+    # SGLANG_FAKE_QUANT_KV_TYPE: "int" + SGLANG_FAKE_QUANT_KV_BITS, or "fp" (NVFP4 only).
+    # Example:  SGLANG_FAKE_QUANT_KV=kv SGLANG_FAKE_QUANT_KV_TYPE=int SGLANG_FAKE_QUANT_KV_BITS=4
+    SGLANG_FAKE_QUANT_KV = EnvStr("")
+    SGLANG_FAKE_QUANT_KV_TYPE = EnvStr("int")
+    SGLANG_FAKE_QUANT_KV_BITS = EnvInt(8)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
