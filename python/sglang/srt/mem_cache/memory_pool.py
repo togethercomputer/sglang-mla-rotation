@@ -84,6 +84,8 @@ _is_fp8_fnuz = is_fp8_fnuz()
 # (K vs V) instead of spamming every ``set_kv_buffer`` call.
 _fake_kv_shape_warn_k = False
 _fake_kv_shape_warn_v = False
+_fake_kv_shape_warn_mla_nope = False
+_fake_kv_shape_warn_mla_rope = False
 
 
 def _maybe_fake_quant_kv_for_mha(
@@ -242,6 +244,90 @@ def _log_mha_fake_quant_kv_init(
         typ,
         bits_part,
     )
+
+
+def _maybe_fake_quant_kv_for_mla(
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Simulate KV quantization on write for ``MLATokenToKVPool`` (env-controlled).
+
+    Same three env vars as ``_maybe_fake_quant_kv_for_mha``:
+
+    - ``SGLANG_FAKE_QUANT_KV``: ``k``/``key`` quantizes k_nope; ``v``/``value`` quantizes
+      k_rope; ``kv``/``both``/``all``/``k+v`` quantizes both.
+    - ``SGLANG_FAKE_QUANT_KV_TYPE``: ``int`` or ``fp``/``nvfp4``/``fp4``/``e2m1``.
+    - ``SGLANG_FAKE_QUANT_KV_BITS``: bit width for ``int`` type (default 8, ignored for fp).
+
+    Both tensors are expected to be ``[tokens, 1, dim]`` which already satisfies the
+    ``(..., heads, dim)`` layout required by the quant functions.
+    """
+    global _fake_kv_shape_warn_mla_nope, _fake_kv_shape_warn_mla_rope
+
+    raw = envs.SGLANG_FAKE_QUANT_KV.get().strip().lower()
+    if not raw or raw in ("0", "false", "none", "off", "disable", "disabled"):
+        return cache_k_nope, cache_k_rope
+
+    apply_nope = raw in ("k", "key")
+    apply_rope = raw in ("v", "value")
+    if raw in ("kv", "both", "all", "k+v"):
+        apply_nope = apply_rope = True
+
+    if not apply_nope and not apply_rope:
+        logger.warning(
+            "SGLANG_FAKE_QUANT_KV=%r is not recognized (use k, v, kv, both, or all); skipping fake quant",
+            envs.SGLANG_FAKE_QUANT_KV.get(),
+        )
+        return cache_k_nope, cache_k_rope
+
+    kind = envs.SGLANG_FAKE_QUANT_KV_TYPE.get().strip().lower()
+    if kind in ("fp", "nvfp4", "fp4", "e2m1"):
+        from sglang.srt.mem_cache.kv_quant_sim import fake_nvfp4_quant_kv_per_head
+
+        def _fq(x: torch.Tensor) -> torch.Tensor:
+            return fake_nvfp4_quant_kv_per_head(x)
+
+    elif kind in ("int", "integer"):
+        bits = envs.SGLANG_FAKE_QUANT_KV_BITS.get()
+        if not (1 <= bits <= 32):
+            logger.warning(
+                "SGLANG_FAKE_QUANT_KV_BITS=%s invalid (need 1..32); skipping fake quant",
+                bits,
+            )
+            return cache_k_nope, cache_k_rope
+        from sglang.srt.mem_cache.kv_quant_sim import fake_int_quant_kv_per_head
+
+        def _fq(x: torch.Tensor) -> torch.Tensor:
+            return fake_int_quant_kv_per_head(x, bits)
+
+    else:
+        logger.warning(
+            "SGLANG_FAKE_QUANT_KV_TYPE=%r not recognized (use int or fp); skipping fake quant",
+            envs.SGLANG_FAKE_QUANT_KV_TYPE.get(),
+        )
+        return cache_k_nope, cache_k_rope
+
+    if apply_nope:
+        if cache_k_nope.ndim >= 2:
+            cache_k_nope = _fq(cache_k_nope)
+        elif not _fake_kv_shape_warn_mla_nope:
+            logger.warning(
+                "Fake quant MLA k_nope skipped: shape %s has fewer than 2 dims",
+                tuple(cache_k_nope.shape),
+            )
+            _fake_kv_shape_warn_mla_nope = True
+
+    if apply_rope:
+        if cache_k_rope.ndim >= 2:
+            cache_k_rope = _fq(cache_k_rope)
+        elif not _fake_kv_shape_warn_mla_rope:
+            logger.warning(
+                "Fake quant MLA k_rope skipped: shape %s has fewer than 2 dims",
+                tuple(cache_k_rope.shape),
+            )
+            _fake_kv_shape_warn_mla_rope = True
+
+    return cache_k_nope, cache_k_rope
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -1795,6 +1881,11 @@ class MLATokenToKVPool(KVCache):
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
                 cache_k_rope = cache_k_rope.to(self.dtype)
+
+            cache_k_nope, cache_k_rope = _maybe_fake_quant_kv_for_mla(
+                cache_k_nope, cache_k_rope
+            )
+
             if self.store_dtype != self.dtype:
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
