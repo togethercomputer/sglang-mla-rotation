@@ -12,10 +12,8 @@ services:
     restart: unless-stopped
 
   jaeger:
-    image: jaegertracing/all-in-one
+    image: jaegertracing/jaeger:latest
     container_name: jaeger
     ports:
       - "16686:16686"
-    environment:
-      - COLLECTOR_OTLP_ENABLED=true
     restart: unless-stopped
